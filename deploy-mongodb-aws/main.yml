@@ -1,0 +1,140 @@
+---
+- name: "Creating AWS Simple Infra Using Ansible Playbook"
+  hosts: localhost
+  vars:
+    project: "MongoDb Server"
+    instance_type: "t2.nano"
+    region: eu-west-3
+    instance_ami: "ami-04a92520784b93e73"
+    vpc_id: "vpc-02579413418ffff8e"
+    subnet_id: "subnet-07e251f3bf344e21a"
+    key_name: "ubuntu-aws-test1"
+    ansible_ssh_private_key_file: "/home/ubuntu/ubuntu-aws-test1.pem"
+  environment:
+    AWS_REGION: "eu-west-3"
+
+  tasks:
+    - name: "AWS Infra - Creating webserver security group"
+      amazon.aws.ec2_group:
+        name: "{{ project }}-webserver"
+        region: "{{ region }}"
+        vpc_id: "{{ vpc_id }}"
+        description: "allows 80,443"
+        rules:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+        tags:
+          Name: "{{ project }}-webserver"
+          project: "{{ project }}"
+      register: webserver
+
+    - name: "AWS Infra - Creating another remote security group"
+      amazon.aws.ec2_group:
+        name: "{{ project }}-remote"
+        region: "{{ region }}"
+        vpc_id: "{{ vpc_id }}"
+        description: "allows 22 for ssh"
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+        tags:
+          Name: "{{ project }}-remote"
+          project: "{{ project }}"
+      register: remote
+
+    - name: "AWS Infra - Creating Ec2 Instance for Installing the webserver"
+      amazon.aws.ec2_instance:
+        key_name: "{{ key_name }}"
+        instance_type: "{{ instance_type }}"
+        subnet_id: "{{ subnet_id }}"
+        image_id: "{{ instance_ami }}"
+        wait: yes
+        security_groups:
+          - "{{ webserver.group_id }}"
+          - "{{ remote.group_id }}"
+        network:
+          assign_public_ip: true
+        tags:
+          Name: "{{ project }}-webserver"
+          project: "{{ project }}"
+      register: if_ec2_status
+
+    - name: "AWS Infra - Creating Dynamic Inventory for the EC2 creation"
+      add_host:
+        name: "{{ item.public_ip_address }}"
+        groups: "amazon"
+        ansible_host: "{{ item.public_ip_address }}"
+        ansible_port: 22
+        ansible_user: "ubuntu"
+        ansible_ssh_private_key_file: "{{ ansible_ssh_private_key_file }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+      with_items:
+        - "{{ if_ec2_status.instances }}"
+
+    # - name: "Debug if_ec2_status"
+    #   debug:
+    #     var: if_ec2_status
+
+    - name: "AWS Infra - Waiting for instances to become Online. Please wait"
+      when: if_ec2_status.changed == true
+      wait_for:
+        timeout: 90
+
+- name: "Install MongoDB"
+  hosts: amazon
+  become: true
+  remote_user: ubuntu
+
+  tasks:
+    - name: Import the MongoDB public key
+      ansible.builtin.apt_key:
+        url: https://pgp.mongodb.com/server-7.0.asc
+        state: present
+        keyring: /usr/share/keyrings/mongodb-server-7.0.gpg
+
+    - name: Add MongoDB repository
+      ansible.builtin.apt_repository:
+        repo: "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse"
+        state: present
+        filename: "mongodb-org-7.0"
+
+    - name: Update APT cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install MongoDB
+      apt:
+        pkg: mongodb-org
+        state: latest
+        update_cache: yes
+      notify:
+        - start mongodb
+
+  handlers:
+    - name: start mongodb
+      service:
+        name: mongod
+        state: started
+        enabled: true
+
+    - name: "AWS Infra - Restart and enable MongoDB"
+      service:
+        name: mongod.service
+        state: restarted
+        enabled: true
+
+    - name: "AWS Infra - command for check"
+      run_once: true
+      debug:
+        msg: "mongosh"
+      with_items:
+        - "{{ groups.amazon }}"
